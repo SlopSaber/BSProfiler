@@ -35,6 +35,7 @@ namespace BSProfiler
         private ProfilerRecorder _cpuRecorder;
         private ProfilerRecorder _gpuRecorder;
         private CaptureWriter? _writer;
+        private CallbackProfiler? _callbackProfiler;
         private Process? _process;
         private XRDisplaySubsystem? _display;
         private long _startTicks;
@@ -83,8 +84,10 @@ namespace BSProfiler
                 DiscoverMetrics(directory);
                 _cpuRecorder = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "CPU Main Thread Frame Time");
                 _gpuRecorder = new ProfilerRecorder("GPU Frame Time", options: ProfilerRecorderOptions.Default | ProfilerRecorderOptions.StartImmediately);
-                WriteSession(directory);
                 _writer = new CaptureWriter(directory, FrameHeader());
+                _callbackProfiler = new CallbackProfiler(directory, root);
+                WriteSession(directory);
+                Plugin.Log?.Info("BSProfiler callback hooks: " + _callbackProfiler.HookCount + " installed, " + _callbackProfiler.FailedCount + " failed");
                 for (int generation = 0; generation < 3; generation++)
                     _lastGcCounts[generation] = GC.CollectionCount(generation);
                 SceneManager.activeSceneChanged += SceneChanged;
@@ -141,6 +144,8 @@ namespace BSProfiler
             session.AppendLine("CPU main recorder: " + _cpuRecorder.Valid);
             session.AppendLine("GPU span recorder: " + _gpuRecorder.Valid);
             session.AppendLine("Tracked markers: " + string.Join(", ", _metrics.Select(metric => metric.Name)));
+            session.AppendLine("Callback hooks: " + (_callbackProfiler?.HookCount ?? 0));
+            session.AppendLine("Callback hook failures: " + (_callbackProfiler?.FailedCount ?? 0));
             session.AppendLine("Loaded plugins:");
             foreach (var metadata in PluginManager.EnabledPlugins.OrderBy(metadata => metadata.Id, StringComparer.OrdinalIgnoreCase))
                 session.AppendLine("  " + metadata.Id + " | " + metadata.Name + " | " + metadata.HVersion);
@@ -219,7 +224,10 @@ namespace BSProfiler
             _writer.Frame(_frameLine.ToString());
 
             if (!double.IsNaN(frameMs))
+            {
+                _callbackProfiler?.CaptureFrame(_writer, elapsedMs, Time.frameCount, _scene, frameMs, Math.Max(12, budgetMs * 1.5));
                 UpdateStatistics(elapsedMs, frameMs, cpuMs, gpuMs, gcBytes, budgetMs);
+            }
             if (_writer.Failure != null && _lastWriterError.Length == 0)
             {
                 _lastWriterError = _writer.Failure.ToString();
@@ -353,6 +361,8 @@ namespace BSProfiler
             CloseIncident();
             WriteSummary(ElapsedMs());
             _writer?.Event(CaptureWriter.Number(ElapsedMs()) + ",stop," + CaptureWriter.Csv("Capture stopped"));
+            _callbackProfiler?.Dispose();
+            _callbackProfiler = null;
             _writer?.Dispose();
             _writer = null;
             _cpuRecorder.Dispose();

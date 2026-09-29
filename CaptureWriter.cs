@@ -15,6 +15,7 @@ namespace BSProfiler
         private readonly StreamWriter _incidents;
         private readonly StreamWriter _summaries;
         private readonly StreamWriter _events;
+        private readonly StreamWriter _callbacks;
         private int _dropped;
 
         public string DirectoryPath { get; }
@@ -29,6 +30,7 @@ namespace BSProfiler
             _incidents = Open("incidents.csv", "start_ms,end_ms,scene,slow_frames,peak_frame,peak_frame_ms,peak_cpu_main_ms,peak_gpu_span_ms,peak_gc_alloc_bytes,threshold_ms");
             _summaries = Open("summaries.csv", "end_ms,scene,frames,mean_ms,p50_ms,p95_ms,p99_ms,worst_ms,slow_frames,mean_cpu_main_ms,mean_gpu_span_ms,gc_gen0,gc_gen1,gc_gen2,queue_dropped");
             _events = Open("events.csv", "elapsed_ms,kind,detail");
+            _callbacks = Open("callback-spikes.csv", "elapsed_ms,frame,scene,frame_ms,scope,assembly,callback,calls,total_ms,max_ms");
             _thread = new Thread(WriteLoop) { IsBackground = true, Name = "BSProfiler writer" };
             _thread.Start();
         }
@@ -44,6 +46,7 @@ namespace BSProfiler
         public void Incident(string line) => Enqueue(1, line);
         public void Summary(string line) => Enqueue(2, line);
         public void Event(string line) => Enqueue(3, line);
+        public void Callback(string line) => Enqueue(4, line);
 
         private void Enqueue(byte kind, string line)
         {
@@ -63,7 +66,8 @@ namespace BSProfiler
                         case 0: _frames.WriteLine(entry.Line); break;
                         case 1: _incidents.WriteLine(entry.Line); break;
                         case 2: _summaries.WriteLine(entry.Line); break;
-                        default: _events.WriteLine(entry.Line); break;
+                        case 3: _events.WriteLine(entry.Line); break;
+                        default: _callbacks.WriteLine(entry.Line); break;
                     }
 
                     long now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -85,6 +89,7 @@ namespace BSProfiler
                 _incidents.Dispose();
                 _summaries.Dispose();
                 _events.Dispose();
+                _callbacks.Dispose();
             }
         }
 
@@ -94,6 +99,7 @@ namespace BSProfiler
             _incidents.Flush();
             _summaries.Flush();
             _events.Flush();
+            _callbacks.Flush();
         }
 
         public void Dispose()
