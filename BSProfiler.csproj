@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <BeatSaberDir Condition="'$(BeatSaberDir)' == ''">D:\BSManager\BSInstances\1.45.2</BeatSaberDir>
     <TargetFramework>net48</TargetFramework>
     <LangVersion>9.0</LangVersion>
     <AssemblyName>BSProfiler</AssemblyName>

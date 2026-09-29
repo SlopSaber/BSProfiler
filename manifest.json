@@ -4,7 +4,7 @@
   "author": "iPixelGalaxy",
   "version": "0.1.0",
   "description": "Records frame timing and performance diagnostics for Beat Saber.",
-  "gameVersion": "1.45.1",
+  "gameVersion": "1.45.2",
   "dependsOn": {
     "BSIPA": "^4.3.0"
   }
