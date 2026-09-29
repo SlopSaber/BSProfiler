@@ -60,8 +60,8 @@ namespace BSProfiler
                 string path;
                 try { path = assembly.IsDynamic ? "" : Path.GetFullPath(assembly.Location); }
                 catch { continue; }
-                if (!path.StartsWith(plugins, StringComparison.OrdinalIgnoreCase) &&
-                    !path.StartsWith(libraries, StringComparison.OrdinalIgnoreCase)) continue;
+                bool isPluginAssembly = path.StartsWith(plugins, StringComparison.OrdinalIgnoreCase);
+                if (!isPluginAssembly && !path.StartsWith(libraries, StringComparison.OrdinalIgnoreCase)) continue;
                 if (assembly == typeof(CallbackProfiler).Assembly) continue;
 
                 Type[] types;
@@ -80,8 +80,9 @@ namespace BSProfiler
                     {
                         if (!type.IsClass || type.ContainsGenericParameters) continue;
                         isBehaviour = typeof(MonoBehaviour).IsAssignableFrom(type);
-                        isStateMachine = typeof(IEnumerator).IsAssignableFrom(type) ||
-                                         typeof(IAsyncStateMachine).IsAssignableFrom(type);
+                        isStateMachine = isPluginAssembly &&
+                            (typeof(IEnumerator).IsAssignableFrom(type) ||
+                             typeof(IAsyncStateMachine).IsAssignableFrom(type));
                         isTickable = type.GetInterfaces().Any(i => i.FullName == "Zenject.ITickable" ||
                             i.FullName == "Zenject.ILateTickable" || i.FullName == "Zenject.IFixedTickable");
                         isHarmonyClass = HasAttribute(type.GetCustomAttributesData(), "HarmonyLib.HarmonyPatch");
@@ -205,9 +206,13 @@ namespace BSProfiler
             if (_disposed) return;
             _disposed = true;
             _active = null;
-            _harmony.UnpatchSelf();
-            _samples.Clear();
-            _methods.Clear();
+            try { _harmony.UnpatchSelf(); }
+            catch (Exception ex) { Plugin.Log?.Error("BSProfiler callback unpatch failed: " + ex); }
+            finally
+            {
+                _samples.Clear();
+                _methods.Clear();
+            }
         }
 
         private sealed class Descriptor
