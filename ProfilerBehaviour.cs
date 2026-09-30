@@ -101,6 +101,8 @@ namespace BSProfiler
                 WriteSession(directory);
                 Plugin.Log?.Info("BSProfiler callback hooks: " + _callbackProfiler.HookCount + " installed, " + _callbackProfiler.FailedCount + " failed");
                 Plugin.Log?.Info("BSProfiler memory hooks: " + _memoryDiagnostics.HookCount + " installed, " + _memoryDiagnostics.FailedCount + " failed");
+                if (!MemoryDiagnostics.AllocationCounterAvailable)
+                    Plugin.Log?.Warn("BSProfiler allocation readings unavailable: " + MemoryDiagnostics.AllocationCounterStatus);
                 for (int generation = 0; generation < 3; generation++)
                 {
                     _lastGcCounts[generation] = GC.CollectionCount(generation);
@@ -167,9 +169,10 @@ namespace BSProfiler
             session.AppendLine("Callback hooks: " + (_callbackProfiler?.HookCount ?? 0));
             session.AppendLine("Callback hook failures: " + (_callbackProfiler?.FailedCount ?? 0));
             session.AppendLine("Per-thread allocation counter: " + MemoryDiagnostics.AllocationCounterAvailable);
+            session.AppendLine("Allocation counter capability: " + MemoryDiagnostics.AllocationCounterStatus);
             session.AppendLine("Memory hooks: " + (_memoryDiagnostics?.HookCount ?? 0));
             session.AppendLine("Memory hook failures: " + (_memoryDiagnostics?.FailedCount ?? 0));
-            session.AppendLine("Slow-call detail: >=8 ms, GC crossing, or exception; max 32 rows per second.");
+            session.AppendLine("Slow-call detail: >=8 ms, GC crossing, exception, or focus callback; max 32 rows per second.");
             session.AppendLine("Recorder values can lag Update wall-clock samples; inspect neighboring frames.");
             session.AppendLine("Callback time and allocation totals are inclusive; nested rows must not be summed.");
             session.AppendLine("Loaded plugins:");

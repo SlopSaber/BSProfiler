@@ -2,6 +2,10 @@
 
 BSProfiler records Beat Saber 1.45.2 performance data under `UserData/BSProfiler/<UTC start>-<process ID>/` in the selected game instance. It starts with the game and closes files on exit. It uses no UI or hotkeys.
 
+At startup, BSProfiler checks whether the allocation API actually counts a known 4,096-byte allocation. An API that exists but returns zero is marked unavailable, with the reason in `session.txt` and the game log; allocation columns stay empty instead of reporting false zeroes. `callback-allocations.csv` then contains only its header. Other memory, collection, and timing records still work.
+
+The callback catalog also includes Unity focus/pause methods, installed-mod focus-event subscribers found at startup, and Chroma's environment object discovery and ID lookup methods. Focus callbacks write individual detail rows even below 8 ms, subject to the same 32-row-per-second cap, so a fast handler can be distinguished from missing coverage. Newly subscribed event delegates are not rediscovered during the run. Background work remains outside main-thread callback timing.
+
 - `frames.csv`: one row per Unity `Update` call, with wall-clock frame time, approximate FPS, display budget, Unity CPU main-thread time, Unity GPU frame span, XR app/compositor GPU time, dropped/presented frame counts, motion-to-photon latency, memory, GC counters, and available Unity profiler markers. It also records main-thread allocated bytes since the previous Update, the previous BSProfiler Update's time and allocated bytes, intervals from the previous Update to LateUpdate and from LateUpdate to this Update, and the cumulative number of omitted slow-call details. Empty cells mean the counter was unavailable. Counter names and units are in the header.
 - `incidents.csv`: runs of frames exceeding `max(12 ms, 1.5 × display frame budget)`. A gap of one second without a slow frame closes a run. The peak frame number links to `frames.csv`.
 - `summaries.csv`: ten-second frame-time percentiles and GC collection deltas. The percentile sample keeps up to 4,096 frames per interval; the mean and worst use every frame.

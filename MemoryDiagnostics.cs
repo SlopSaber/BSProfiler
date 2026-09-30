@@ -11,6 +11,7 @@ namespace BSProfiler
 {
     internal sealed class MemoryDiagnostics : IDisposable
     {
+        private static string _allocationCounterStatus = "Not initialized";
         private static readonly Func<long>? AllocationCounter = CreateAllocationCounter();
         private static MemoryDiagnostics? _active;
         [ThreadStatic] private static int _depth;
@@ -24,6 +25,7 @@ namespace BSProfiler
         public int FailedCount { get; private set; }
 
         public static bool AllocationCounterAvailable => AllocationCounter != null;
+        public static string AllocationCounterStatus => _allocationCounterStatus;
         public static long AllocatedBytes() => AllocationCounter == null ? -1 : AllocationCounter();
 
         private static Func<long>? CreateAllocationCounter()
@@ -31,12 +33,29 @@ namespace BSProfiler
             try
             {
                 MethodInfo? method = typeof(GC).GetMethod("GetAllocatedBytesForCurrentThread", Type.EmptyTypes);
-                if (method == null) return null;
+                if (method == null)
+                {
+                    _allocationCounterStatus = "API absent";
+                    return null;
+                }
                 var counter = (Func<long>)Delegate.CreateDelegate(typeof(Func<long>), method);
-                counter();
+                long before = counter();
+                byte[] probe = new byte[4096];
+                long after = counter();
+                GC.KeepAlive(probe);
+                if (after - before < probe.Length)
+                {
+                    _allocationCounterStatus = "API did not count a 4096-byte startup allocation; readings unavailable";
+                    return null;
+                }
+                _allocationCounterStatus = "Startup allocation observed";
                 return counter;
             }
-            catch { return null; }
+            catch (Exception ex)
+            {
+                _allocationCounterStatus = ex.GetType().Name + ": " + ex.Message;
+                return null;
+            }
         }
 
         public MemoryDiagnostics(CaptureWriter writer, long startTicks)

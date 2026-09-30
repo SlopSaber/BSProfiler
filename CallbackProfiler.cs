@@ -32,6 +32,7 @@ namespace BSProfiler
         private readonly Dictionary<string, Sample> _assemblies = new Dictionary<string, Sample>(StringComparer.Ordinal);
         private readonly List<Sample> _frameSamples = new List<Sample>();
         private readonly List<Sample> _frameAssemblies = new List<Sample>();
+        private readonly HashSet<MethodBase> _focusHandlers = new HashSet<MethodBase>();
         private readonly int _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         private readonly CaptureWriter _writer;
         private readonly long _startTicks;
@@ -63,6 +64,14 @@ namespace BSProfiler
             var prefix = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(Begin), BindingFlags.NonPublic | BindingFlags.Static));
             var finalizer = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(End), BindingFlags.NonPublic | BindingFlags.Static));
             var catalog = new List<string> { "assembly,callback,kind,source,status" };
+
+            try
+            {
+                FieldInfo? field = typeof(Application).GetField("focusChanged", BindingFlags.Static | BindingFlags.NonPublic);
+                if (field?.GetValue(null) is Delegate handlers)
+                    foreach (Delegate handler in handlers.GetInvocationList()) _focusHandlers.Add(handler.Method);
+            }
+            catch (Exception ex) { Plugin.Log?.Warn("BSProfiler focus subscriber discovery failed: " + ex.Message); }
 
             _active = this;
             foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
@@ -104,13 +113,22 @@ namespace BSProfiler
                     foreach (MethodInfo method in methods)
                     {
                         if (!isBehaviour && !isStateMachine && !isTickable && !isHarmonyClass &&
-                            method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer") continue;
+                            method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer" &&
+                            !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method)) continue;
                         string? kind = null;
                         try
                         {
                             if (method.IsAbstract || method.ContainsGenericParameters || method.GetMethodBody() == null) continue;
                             if (isBehaviour && UnityCallbacks.Contains(method.Name) && IsVoidWithoutParameters(method))
                                 kind = "Unity callback";
+                            else if (isBehaviour && (method.Name == "OnApplicationFocus" || method.Name == "OnApplicationPause") &&
+                                     method.ReturnType == typeof(void) && method.GetParameters().Length == 1 &&
+                                     method.GetParameters()[0].ParameterType == typeof(bool))
+                                kind = "Unity focus/pause callback";
+                            else if (_focusHandlers.Contains(method))
+                                kind = "Application.focusChanged subscriber";
+                            else if (IsEnvironmentSetup(method))
+                                kind = "Chroma environment setup";
                             else if (isTickable && TickCallbacks.Contains(method.Name) && IsVoidWithoutParameters(method))
                                 kind = "Zenject tick";
                             else if (isStateMachine && method.Name == "MoveNext" && method.GetParameters().Length == 0)
@@ -124,7 +142,8 @@ namespace BSProfiler
                         catch { continue; }
                         if (kind == null) continue;
 
-                        var descriptor = new Descriptor(assembly.GetName().Name ?? "", type.FullName + "." + method.Name);
+                        var descriptor = new Descriptor(assembly.GetName().Name ?? "", type.FullName + "." + method.Name,
+                            kind == "Unity focus/pause callback" || kind == "Application.focusChanged subscriber");
                         _samples[method] = new Sample(descriptor);
                         if (!_assemblies.ContainsKey(descriptor.Assembly))
                             _assemblies.Add(descriptor.Assembly, new Sample(new Descriptor(descriptor.Assembly, "")));
@@ -151,6 +170,10 @@ namespace BSProfiler
 
         private static bool IsVoidWithoutParameters(MethodInfo method) =>
             method.ReturnType == typeof(void) && method.GetParameters().Length == 0;
+
+        private static bool IsEnvironmentSetup(MethodInfo method) =>
+            (method.DeclaringType?.FullName == "Chroma.EnvironmentEnhancement.EnvironmentEnhancementManager" && method.Name == "GetAllGameObjects") ||
+            (method.DeclaringType?.FullName == "Chroma.EnvironmentEnhancement.LookupID" && method.Name == "Get");
 
         private static bool HasAttribute(IList<CustomAttributeData> attributes, string name) =>
             attributes.Any(attribute => attribute.AttributeType.FullName == name);
@@ -184,7 +207,7 @@ namespace BSProfiler
             Sample assembly = profiler._assemblies[sample.Descriptor.Assembly];
             if (assembly.Calls == 0) profiler._frameAssemblies.Add(assembly);
             assembly.Add(ticks, bytes, crossing);
-            if (ticks * 1000.0 / Stopwatch.Frequency < 8 && !crossing && __exception == null) return;
+            if (ticks * 1000.0 / Stopwatch.Frequency < 8 && !crossing && __exception == null && !sample.Descriptor.IsFocus) return;
             if (now - profiler._detailWindowTicks >= Stopwatch.Frequency)
             {
                 profiler._detailWindowTicks = now;
@@ -269,7 +292,9 @@ namespace BSProfiler
         {
             public readonly string Assembly;
             public readonly string Callback;
-            public Descriptor(string assembly, string callback) { Assembly = assembly; Callback = callback; }
+            public readonly bool IsFocus;
+            public Descriptor(string assembly, string callback, bool isFocus = false)
+            { Assembly = assembly; Callback = callback; IsFocus = isFocus; }
         }
 
         private sealed class Sample
