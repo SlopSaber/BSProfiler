@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -29,7 +30,10 @@ namespace BSProfiler
 
         private static CallbackProfiler? _active;
         private readonly Harmony _harmony = new Harmony(HarmonyId);
-        private readonly Dictionary<MethodBase, Sample> _samples = new Dictionary<MethodBase, Sample>();
+        private readonly ConcurrentDictionary<MethodBase, Sample> _samples = new ConcurrentDictionary<MethodBase, Sample>();
+        private readonly string _directory, _gameRoot;
+        private readonly List<string> _catalog = new List<string> { "assembly,callback,kind,source,status,method_signature" };
+        public bool InstallationComplete { get; private set; }
         private readonly Dictionary<string, Sample> _assemblies = new Dictionary<string, Sample>(StringComparer.Ordinal);
         private readonly List<Sample> _frameSamples = new List<Sample>();
         private readonly List<Sample> _frameAssemblies = new List<Sample>();
@@ -62,22 +66,54 @@ namespace BSProfiler
             _writer = writer;
             _startTicks = startTicks;
             _retention = retention;
-            try { Install(directory, gameRoot); }
-            catch
-            {
-                Dispose();
-                throw;
-            }
+            _directory = directory;
+            _gameRoot = gameRoot;
             _installing = false;
         }
 
-        private void Install(string directory, string gameRoot)
+        public IEnumerator InstallRoutine(Action completed)
+        {
+            // Let the game produce frames before starting discovery and method rewriting.
+            yield return null;
+            long start = Stopwatch.GetTimestamp();
+            long workTicks = 0;
+            using (IEnumerator<object?> steps = Install(_directory, _gameRoot))
+            {
+                while (!_disposed)
+                {
+                    long before = Stopwatch.GetTimestamp();
+                    bool more;
+                    _installing = true;
+                    try { more = steps.MoveNext(); }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log?.Error("BSProfiler callback installation failed: " + ex);
+                        _writer.Event(CaptureWriter.Number(ElapsedMs()) + ",callback-install-failed," + CaptureWriter.Csv(ex.Message));
+                        more = false;
+                    }
+                    finally { _installing = false; workTicks += Stopwatch.GetTimestamp() - before; }
+                    if (!more) break;
+                    yield return null;
+                }
+            }
+            if (_disposed) yield break;
+            // Install marks success only after the complete catalog has been written.
+            _writer.Event(CaptureWriter.Number(ElapsedMs()) + ",callback-install-finished," + CaptureWriter.Csv(
+                "complete=" + InstallationComplete + "; work_ms=" + CaptureWriter.Number(workTicks * 1000.0 / Stopwatch.Frequency) +
+                "; wall_ms=" + CaptureWriter.Number((Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency) + "; hooks=" + HookCount));
+            completed();
+        }
+
+        private double ElapsedMs() => (Stopwatch.GetTimestamp() - _startTicks) * 1000.0 / Stopwatch.Frequency;
+
+        private IEnumerator<object?> Install(string directory, string gameRoot)
         {
             string plugins = Path.GetFullPath(Path.Combine(gameRoot, "Plugins")) + Path.DirectorySeparatorChar;
             string libraries = Path.GetFullPath(Path.Combine(gameRoot, "Libs")) + Path.DirectorySeparatorChar;
             var prefix = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(Begin), BindingFlags.NonPublic | BindingFlags.Static));
             var finalizer = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(End), BindingFlags.NonPublic | BindingFlags.Static));
-            var catalog = new List<string> { "assembly,callback,kind,source,status,method_signature" };
+            var catalog = _catalog;
+            var slice = Stopwatch.StartNew();
 
             try
             {
@@ -92,6 +128,7 @@ namespace BSProfiler
             int discoveryFailures = 0;
             foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
+                long discoveryStart = Stopwatch.GetTimestamp();
                 try
                 {
                     string source = assembly.IsDynamic ? "" : Path.GetFullPath(assembly.Location);
@@ -108,6 +145,9 @@ namespace BSProfiler
                         CallbackDiscovery.Collect(discovered, _delegateTargets, ref discoveryFailures);
                 }
                 catch { discoveryFailures++; }
+                _writer.Event(CaptureWriter.Number(ElapsedMs()) + ",callback-discovery," + CaptureWriter.Csv(
+                    assembly.GetName().Name + "; work_ms=" + CaptureWriter.Number((Stopwatch.GetTimestamp() - discoveryStart) * 1000.0 / Stopwatch.Frequency)));
+                if (slice.Elapsed.TotalMilliseconds >= 2) { yield return null; slice.Restart(); }
             }
             DiscoveryFailures = discoveryFailures;
             foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
@@ -121,6 +161,8 @@ namespace BSProfiler
 
                 if (!assemblyTypes.TryGetValue(assembly, out Type[] types)) continue;
                 int assemblyExtraHooks = 0;
+                long assemblyWorkTicks = 0;
+                long assemblyStart = Stopwatch.GetTimestamp();
 
                 foreach (Type type in types)
                 {
@@ -146,6 +188,7 @@ namespace BSProfiler
 
                     foreach (MethodInfo method in methods)
                     {
+                        if (slice.Elapsed.TotalMilliseconds >= 2) { yield return null; slice.Restart(); }
                         if (!isBehaviour && !isStateMachine && !isTickable && !isHarmonyClass &&
                             method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer" &&
                             !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method) &&
@@ -193,6 +236,7 @@ namespace BSProfiler
                         if (!_assemblies.ContainsKey(descriptor.Assembly))
                             _assemblies.Add(descriptor.Assembly, new Sample(new Descriptor(descriptor.Assembly, "")));
                         string status = "installed";
+                        long patchStart = Stopwatch.GetTimestamp();
                         try
                         {
                             _harmony.Patch(method, prefix: prefix, finalizer: finalizer);
@@ -201,17 +245,22 @@ namespace BSProfiler
                         }
                         catch (Exception ex)
                         {
-                            _samples.Remove(method);
+                            _samples.TryRemove(method, out _);
                             FailedCount++;
                             status = ex.GetType().Name + ": " + ex.Message;
                         }
+                        assemblyWorkTicks += Stopwatch.GetTimestamp() - patchStart;
                         catalog.Add(string.Join(",", CaptureWriter.Csv(descriptor.Assembly),
                             CaptureWriter.Csv(descriptor.Callback), CaptureWriter.Csv(kind),
                             CaptureWriter.Csv(path), CaptureWriter.Csv(status), CaptureWriter.Csv(descriptor.Signature)));
                     }
                 }
+                _writer.Event(CaptureWriter.Number(ElapsedMs()) + ",callback-assembly-installed," + CaptureWriter.Csv(
+                    assembly.GetName().Name + "; patch_ms=" + CaptureWriter.Number(assemblyWorkTicks * 1000.0 / Stopwatch.Frequency) +
+                    "; wall_ms=" + CaptureWriter.Number((Stopwatch.GetTimestamp() - assemblyStart) * 1000.0 / Stopwatch.Frequency) + "; total_hooks=" + HookCount));
             }
             File.WriteAllLines(Path.Combine(directory, "callback-catalog.csv"), catalog);
+            InstallationComplete = true;
         }
 
         private static bool IsVoidWithoutParameters(MethodInfo method) =>
@@ -394,6 +443,11 @@ namespace BSProfiler
             catch (Exception ex) { Plugin.Log?.Error("BSProfiler callback unpatch failed: " + ex); }
             finally
             {
+                if (!InstallationComplete)
+                {
+                    try { File.WriteAllLines(Path.Combine(_directory, "callback-catalog.csv"), _catalog); }
+                    catch (Exception ex) { Plugin.Log?.Warn("BSProfiler partial catalog write failed: " + ex.Message); }
+                }
                 // Background finalizers may already hold this instance. Keep their immutable
                 // method lookup intact; it is released with the disposed profiler instance.
                 _assemblies.Clear();

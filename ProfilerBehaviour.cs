@@ -78,6 +78,8 @@ namespace BSProfiler
         private int _incidentPeakFrame;
         private string _incidentScene = "";
         private bool _stopped;
+        private string? _captureDirectory;
+        private readonly List<string> _startupEvents = new List<string>();
 
         private void Awake()
         {
@@ -91,16 +93,23 @@ namespace BSProfiler
                 string root = Path.GetDirectoryName(Application.dataPath) ?? Application.dataPath;
                 string directory = Path.Combine(root, "UserData", "BSProfiler", _startUtc.ToString("yyyyMMdd-HHmmss") + "-" + _process.Id);
                 Directory.CreateDirectory(directory);
-                DiscoverMetrics(directory);
-                _cpuRecorder = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "CPU Main Thread Frame Time");
-                _gpuRecorder = new ProfilerRecorder("GPU Frame Time", options: ProfilerRecorderOptions.Default | ProfilerRecorderOptions.StartImmediately);
-                _writer = new CaptureWriter(directory, FrameHeader());
-                _memoryTracker = new MemoryTracker(_writer, _startTicks, _startUtc);
-                _callbackProfiler = new CallbackProfiler(directory, root, _writer, _startTicks, _memoryTracker.Retention);
-                _memoryDiagnostics = new MemoryDiagnostics(_writer, _startTicks);
+                _captureDirectory = directory;
+                Plugin.Log?.Info("BSProfiler bootstrap started");
+                StartupPhase("recorder-discovery", () => DiscoverMetrics(directory));
+                StartupPhase("frame-recorders", () =>
+                {
+                    _cpuRecorder = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "CPU Main Thread Frame Time");
+                    _gpuRecorder = new ProfilerRecorder("GPU Frame Time", options: ProfilerRecorderOptions.Default | ProfilerRecorderOptions.StartImmediately);
+                });
+                StartupPhase("capture-writer", () => _writer = new CaptureWriter(directory, FrameHeader()));
+                StartupPhase("memory-tracker", () => _memoryTracker = new MemoryTracker(_writer!, _startTicks, _startUtc));
+                StartupPhase("callback-setup", () => _callbackProfiler = new CallbackProfiler(directory, root, _writer!, _startTicks, _memoryTracker!.Retention));
+                StartupPhase("memory-parser-hooks", () => _memoryDiagnostics = new MemoryDiagnostics(_writer!, _startTicks));
+                foreach (string row in _startupEvents) _writer!.Event(row);
+                _startupEvents.Clear();
                 WriteSession(directory);
-                Plugin.Log?.Info("BSProfiler callback hooks: " + _callbackProfiler.HookCount + " installed, " + _callbackProfiler.FailedCount + " failed");
-                Plugin.Log?.Info("BSProfiler memory hooks: " + _memoryDiagnostics.HookCount + " installed, " + _memoryDiagnostics.FailedCount + " failed");
+                Plugin.Log?.Info("BSProfiler callback installation scheduled; startup callback coverage is partial until completion");
+                Plugin.Log?.Info("BSProfiler memory hooks: " + _memoryDiagnostics!.HookCount + " installed, " + _memoryDiagnostics.FailedCount + " failed");
                 if (!MemoryDiagnostics.AllocationCounterAvailable)
                     Plugin.Log?.Warn("BSProfiler allocation readings unavailable: " + MemoryDiagnostics.AllocationCounterStatus);
                 for (int generation = 0; generation < 3; generation++)
@@ -113,12 +122,36 @@ namespace BSProfiler
                 SceneManager.sceneUnloaded += SceneUnloaded;
                 Application.logMessageReceivedThreaded += LogReceived;
                 Plugin.Log?.Info("BSProfiler capture: " + directory);
+                StartCoroutine(_callbackProfiler!.InstallRoutine(() =>
+                {
+                    if (_stopped) return;
+                    WriteSession(directory);
+                    Plugin.Log?.Info("BSProfiler callback hooks: " + _callbackProfiler.HookCount + " installed, " +
+                        _callbackProfiler.FailedCount + " failed; complete=" + _callbackProfiler.InstallationComplete);
+                }));
             }
             catch (Exception ex)
             {
                 Plugin.Log?.Error("BSProfiler could not start: " + ex);
                 StopCapture();
                 enabled = false;
+            }
+        }
+
+        private void StartupPhase(string name, Action work)
+        {
+            long start = Stopwatch.GetTimestamp();
+            int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+            long heap = UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong();
+            try { work(); }
+            finally
+            {
+                long end = Stopwatch.GetTimestamp();
+                _startupEvents.Add(CaptureWriter.Number((end - _startTicks) * 1000.0 / Stopwatch.Frequency) +
+                    ",startup-phase," + CaptureWriter.Csv(name + "; start_ms=" + CaptureWriter.Number((start - _startTicks) * 1000.0 / Stopwatch.Frequency) +
+                    "; work_ms=" + CaptureWriter.Number((end - start) * 1000.0 / Stopwatch.Frequency) +
+                    "; managed_heap_delta_bytes=" + (UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong() - heap) +
+                    "; gc_delta=" + (GC.CollectionCount(0) - gc0) + "/" + (GC.CollectionCount(1) - gc1) + "/" + (GC.CollectionCount(2) - gc2)));
             }
         }
 
@@ -151,7 +184,19 @@ namespace BSProfiler
             var session = new StringBuilder();
             session.AppendLine("BSProfiler 0.1.0");
             session.AppendLine("UTC start: " + _startUtc.ToString("O"));
-            session.AppendLine("Capture schema: 5");
+            session.AppendLine("Capture schema: 6");
+            if (_process != null)
+            {
+                try
+                {
+                    DateTime processStart = _process.StartTime.ToUniversalTime();
+                    session.AppendLine("Process UTC start: " + processStart.ToString("O"));
+                    session.AppendLine("Process start to capture ms: " + CaptureWriter.Number((_startUtc - processStart).TotalMilliseconds));
+                }
+                catch (Exception ex) { session.AppendLine("Process start unavailable: " + ex.GetType().Name); }
+            }
+            session.AppendLine("Callback installation complete: " + (_callbackProfiler?.InstallationComplete ?? false));
+            session.AppendLine("Callback setup is incremental on the main thread, soft 2 ms work slices; individual discovery/patch operations can exceed the slice. Callback startup coverage is partial until callback-install-finished. Early process/IPA loading before capture requires game logs or an external trace. events.csv records startup phases, per-assembly discovery/patch timing and completion.");
             session.AppendLine("Main thread ID: " + System.Threading.Thread.CurrentThread.ManagedThreadId);
             session.AppendLine("Memory operations include CustomJSONData v2/v3 top-level parser spans on their actual thread, with start/end elapsed bounds and most recently observed frame/scene. Nested parser/memory hooks on the same thread are suppressed. GC overlap remains unattributed.");
             session.AppendLine("BSProfiler module MVID: " + typeof(ProfilerBehaviour).Assembly.ManifestModule.ModuleVersionId);
@@ -437,6 +482,7 @@ namespace BSProfiler
         {
             if (_stopped) return;
             _stopped = true;
+            StopAllCoroutines();
             Plugin.Log?.Info("BSProfiler stopping capture; processQuitting=" + processQuitting);
             SceneManager.activeSceneChanged -= SceneChanged;
             SceneManager.sceneLoaded -= SceneLoaded;
@@ -445,6 +491,11 @@ namespace BSProfiler
             CloseIncident();
             WriteSummary(ElapsedMs());
             _writer?.Event(CaptureWriter.Number(ElapsedMs()) + ",stop," + CaptureWriter.Csv("Capture stopped"));
+            if (_captureDirectory != null)
+            {
+                try { WriteSession(_captureDirectory); }
+                catch (Exception ex) { Plugin.Log?.Warn("BSProfiler final session write failed: " + ex.Message); }
+            }
             _callbackProfiler?.Stop(processQuitting);
             _callbackProfiler = null;
             _memoryTracker?.Dispose();
