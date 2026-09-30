@@ -148,7 +148,7 @@ namespace BSProfiler
                         if (kind == null) continue;
 
                         var descriptor = new Descriptor(assembly.GetName().Name ?? "", type.FullName + "." + method.Name,
-                            kind == "Unity focus/pause callback" || kind == "Application.focusChanged subscriber");
+                            kind == "Unity focus/pause callback" || kind == "Application.focusChanged subscriber", assembly);
                         _samples[method] = new Sample(descriptor);
                         if (!_assemblies.ContainsKey(descriptor.Assembly))
                             _assemblies.Add(descriptor.Assembly, new Sample(new Descriptor(descriptor.Assembly, "")));
@@ -241,7 +241,7 @@ namespace BSProfiler
 
         private void ObserveReceiver(object? instance, Sample sample)
         {
-            try { _retention.Observe(instance, sample.Descriptor.Assembly); }
+            try { _retention.Observe(instance, sample.Descriptor.OwnerAssembly!); }
             catch { } // Observation must preserve the original callback and exception.
         }
 
@@ -311,8 +311,9 @@ namespace BSProfiler
             public readonly string Assembly;
             public readonly string Callback;
             public readonly bool IsFocus;
-            public Descriptor(string assembly, string callback, bool isFocus = false)
-            { Assembly = assembly; Callback = callback; IsFocus = isFocus; }
+            public readonly Assembly? OwnerAssembly;
+            public Descriptor(string assembly, string callback, bool isFocus = false, Assembly? ownerAssembly = null)
+            { Assembly = assembly; Callback = callback; IsFocus = isFocus; OwnerAssembly = ownerAssembly; }
         }
 
         private sealed class Sample

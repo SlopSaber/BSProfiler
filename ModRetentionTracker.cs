@@ -28,11 +28,13 @@ namespace BSProfiler
 
         public ModRetentionTracker(CaptureWriter writer, long startTicks) { _writer = writer; _startTicks = startTicks; }
 
-        public void Observe(object? instance, string assembly)
+        public void Observe(object? instance, Assembly ownerAssembly)
         {
             if (_disposed || instance == null || instance.GetType().IsValueType || _known.TryGetValue(instance, out _)) return;
             // Do not assign a game-owned inherited receiver to a mod merely because its callback was patched.
-            if (instance.GetType().Assembly.GetName().Name != assembly) return;
+            if (instance.GetType().Assembly != ownerAssembly) return;
+            // Saturated receivers can run millions of times. Reject without metadata allocation or a lock.
+            if (Volatile.Read(ref _instanceCount) >= InstanceLimit) { Interlocked.Increment(ref _dropped); return; }
             lock (_observeLock)
             {
                 if (_disposed || _known.TryGetValue(instance, out _)) return;
