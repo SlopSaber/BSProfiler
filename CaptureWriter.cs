@@ -16,6 +16,9 @@ namespace BSProfiler
         private readonly StreamWriter _summaries;
         private readonly StreamWriter _events;
         private readonly StreamWriter _callbacks;
+        private readonly StreamWriter _allocations;
+        private readonly StreamWriter _memory;
+        private readonly StreamWriter _slowCalls;
         private int _dropped;
 
         public string DirectoryPath { get; }
@@ -30,7 +33,10 @@ namespace BSProfiler
             _incidents = Open("incidents.csv", "start_ms,end_ms,scene,slow_frames,peak_frame,peak_frame_ms,peak_cpu_main_ms,peak_gpu_span_ms,peak_gc_alloc_bytes,threshold_ms");
             _summaries = Open("summaries.csv", "end_ms,scene,frames,mean_ms,p50_ms,p95_ms,p99_ms,worst_ms,slow_frames,mean_cpu_main_ms,mean_gpu_span_ms,gc_gen0,gc_gen1,gc_gen2,queue_dropped");
             _events = Open("events.csv", "elapsed_ms,kind,detail");
-            _callbacks = Open("callback-spikes.csv", "elapsed_ms,frame,scene,frame_ms,scope,assembly,callback,calls,total_ms,max_ms");
+            _callbacks = Open("callback-spikes.csv", "elapsed_ms,frame,scene,frame_ms,scope,assembly,callback,calls,total_ms,max_ms,total_alloc_bytes,max_call_alloc_bytes,gc_crossing_calls");
+            _allocations = Open("callback-allocations.csv", "end_ms,interval_ms,frame,scene,scope,assembly,callback,calls,total_alloc_bytes,max_call_alloc_bytes,total_ms,gc_crossing_calls");
+            _memory = Open("memory-operations.csv", "elapsed_ms,frame,scene,thread_id,operation,duration_ms,gc_gen0_delta,gc_gen1_delta,gc_gen2_delta,exception,caller_stack");
+            _slowCalls = Open("slow-calls.csv", "elapsed_ms,frame,assembly,callback,duration_ms,alloc_bytes,gc_gen0_delta,gc_gen1_delta,gc_gen2_delta,exception,caller_stack");
             _thread = new Thread(WriteLoop) { IsBackground = true, Name = "BSProfiler writer" };
             _thread.Start();
         }
@@ -47,11 +53,18 @@ namespace BSProfiler
         public void Summary(string line) => Enqueue(2, line);
         public void Event(string line) => Enqueue(3, line);
         public void Callback(string line) => Enqueue(4, line);
+        public void Allocation(string line) => Enqueue(5, line);
+        public void Memory(string line) => Enqueue(6, line);
+        public void SlowCall(string line) => Enqueue(7, line);
 
         private void Enqueue(byte kind, string line)
         {
-            if (Failure != null || _queue.IsAddingCompleted || !_queue.TryAdd(new Entry(kind, line)))
-                Interlocked.Increment(ref _dropped);
+            try
+            {
+                if (Failure != null || _queue.IsAddingCompleted || !_queue.TryAdd(new Entry(kind, line)))
+                    Interlocked.Increment(ref _dropped);
+            }
+            catch (InvalidOperationException) { Interlocked.Increment(ref _dropped); }
         }
 
         private void WriteLoop()
@@ -67,7 +80,10 @@ namespace BSProfiler
                         case 1: _incidents.WriteLine(entry.Line); break;
                         case 2: _summaries.WriteLine(entry.Line); break;
                         case 3: _events.WriteLine(entry.Line); break;
-                        default: _callbacks.WriteLine(entry.Line); break;
+                        case 4: _callbacks.WriteLine(entry.Line); break;
+                        case 5: _allocations.WriteLine(entry.Line); break;
+                        case 6: _memory.WriteLine(entry.Line); break;
+                        case 7: _slowCalls.WriteLine(entry.Line); break;
                     }
 
                     long now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -90,6 +106,9 @@ namespace BSProfiler
                 _summaries.Dispose();
                 _events.Dispose();
                 _callbacks.Dispose();
+                _allocations.Dispose();
+                _memory.Dispose();
+                _slowCalls.Dispose();
             }
         }
 
@@ -100,6 +119,9 @@ namespace BSProfiler
             _summaries.Flush();
             _events.Flush();
             _callbacks.Flush();
+            _allocations.Flush();
+            _memory.Flush();
+            _slowCalls.Flush();
         }
 
         public void Dispose()
