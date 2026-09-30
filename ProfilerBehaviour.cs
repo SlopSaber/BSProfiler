@@ -151,7 +151,9 @@ namespace BSProfiler
             var session = new StringBuilder();
             session.AppendLine("BSProfiler 0.1.0");
             session.AppendLine("UTC start: " + _startUtc.ToString("O"));
-            session.AppendLine("Capture schema: 4");
+            session.AppendLine("Capture schema: 5");
+            session.AppendLine("Main thread ID: " + System.Threading.Thread.CurrentThread.ManagedThreadId);
+            session.AppendLine("Memory operations include CustomJSONData v2/v3 top-level parser spans on their actual thread, with start/end elapsed bounds and most recently observed frame/scene. Nested parser/memory hooks on the same thread are suppressed. GC overlap remains unattributed.");
             session.AppendLine("BSProfiler module MVID: " + typeof(ProfilerBehaviour).Assembly.ManifestModule.ModuleVersionId);
             session.AppendLine("Game version: " + Application.version);
             session.AppendLine("Unity version: " + Application.unityVersion);

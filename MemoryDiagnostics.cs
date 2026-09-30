@@ -77,6 +77,17 @@ namespace BSProfiler
                 if (method.Name == "Collect" && method.GetMethodBody() != null) methods.Add(method);
             MethodInfo? unload = typeof(Resources).GetMethod(nameof(Resources.UnloadUnusedAssets), Type.EmptyTypes);
             if (unload != null && unload.GetMethodBody() != null) methods.Add(unload);
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (assembly.GetName().Name != "CustomJSONData") continue;
+                foreach (string name in new[] { "Version2_6_0AndEarlierCustomBeatmapSaveData", "Version3CustomBeatmapSaveData" })
+                {
+                    Type? type = assembly.GetType("CustomJSONData.CustomBeatmap." + name);
+                    if (type == null) continue;
+                    foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                        if (method.Name == "Deserialize" && method.GetMethodBody() != null) methods.Add(method);
+                }
+            }
             foreach (MethodInfo method in methods)
             {
                 string status = "installed";
@@ -109,6 +120,8 @@ namespace BSProfiler
             if (_depth++ != 0) return;
             try
             {
+                __state.Frame = Volatile.Read(ref _active._frame);
+                __state.Scene = Volatile.Read(ref _active._scene);
                 __state.Stack = new StackTrace(2, false).ToString();
                 if (__state.Stack.Length > 12000) __state.Stack = __state.Stack.Substring(0, 12000);
                 __state.Gc0 = GC.CollectionCount(0);
@@ -133,7 +146,9 @@ namespace BSProfiler
                     Thread.CurrentThread.ManagedThreadId.ToString(), CaptureWriter.Csv(__originalMethod.DeclaringType?.FullName + "." + __originalMethod),
                     CaptureWriter.Number((now - __state.Ticks) * 1000.0 / Stopwatch.Frequency),
                     (GC.CollectionCount(0) - __state.Gc0).ToString(), (GC.CollectionCount(1) - __state.Gc1).ToString(),
-                    (GC.CollectionCount(2) - __state.Gc2).ToString(), CaptureWriter.Csv(__exception?.GetType().FullName), CaptureWriter.Csv(__state.Stack)));
+                    (GC.CollectionCount(2) - __state.Gc2).ToString(), CaptureWriter.Csv(__exception?.GetType().FullName), CaptureWriter.Csv(__state.Stack),
+                    CaptureWriter.Number((__state.Ticks - active._startTicks) * 1000.0 / Stopwatch.Frequency), __state.Frame.ToString(),
+                    CaptureWriter.Csv(__state.Scene), __originalMethod.DeclaringType?.Assembly.GetName().Name == "CustomJSONData" ? "json-parser" : "explicit-memory-operation"));
             }
             catch { } // Preserve the original operation and any original exception.
         }
@@ -155,6 +170,8 @@ namespace BSProfiler
             public long Ticks;
             public int Gc0, Gc1, Gc2;
             public string? Stack;
+            public int Frame;
+            public string? Scene;
         }
     }
 }

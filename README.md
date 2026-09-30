@@ -54,3 +54,7 @@ Build for the selected instance with `dotnet build BSProfiler.csproj -c Release 
 ## Shutdown
 
 On application quit, timing and memory hooks become inactive, without synchronously unpatching thousands of methods during process teardown. Normal live capture disposal still unpatches. Stop begin/end are logged; writer draining waits at most two seconds, then the background writer can continue. A timeout warning means remaining records may be incomplete when the process exits. This prevents an unlimited writer join from holding shutdown; it does not prove every other mod exits promptly.
+
+## Worker parser evidence (schema 5)
+
+`memory-operations.csv` also times CustomJSONData top-level v2/v3 `Deserialize` methods on their actual thread. `session.txt` reports the main thread ID; rows add `kind`, start elapsed time, and start frame/scene. End frame/scene values are the most recent observations from the main thread; worker frame IDs are approximate, so correlate elapsed bounds with frame and GC records. Nested hooks on one thread are suppressed; ordinary callback timing remains main-thread only. Parsing time is inclusive wall time, not total beatmap conversion time. This does not measure heap ownership or prove which worker allocation triggered a collection. Hook status is in `memory-hooks.csv`; methods unavailable at startup cannot be timed.
