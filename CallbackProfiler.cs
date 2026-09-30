@@ -34,6 +34,15 @@ namespace BSProfiler
         private readonly List<Sample> _frameSamples = new List<Sample>();
         private readonly List<Sample> _frameAssemblies = new List<Sample>();
         private readonly HashSet<MethodBase> _focusHandlers = new HashSet<MethodBase>();
+        private readonly HashSet<MethodBase> _delegateTargets = new HashSet<MethodBase>();
+        private readonly ActiveCall[] _calls = new ActiveCall[128];
+        private int _depth;
+        private long _nextCallId, _hookTicks, _rootTicks;
+        private int _rootGcCrossings;
+        public int ExtraHooks { get; private set; }
+        public int ExtraHooksOmitted { get; private set; }
+        public int DiscoveryFailures { get; private set; }
+        public int DepthDropped { get; private set; }
         private readonly int _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         private readonly CaptureWriter _writer;
         private readonly long _startTicks;
@@ -68,7 +77,7 @@ namespace BSProfiler
             string libraries = Path.GetFullPath(Path.Combine(gameRoot, "Libs")) + Path.DirectorySeparatorChar;
             var prefix = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(Begin), BindingFlags.NonPublic | BindingFlags.Static));
             var finalizer = new HarmonyMethod(typeof(CallbackProfiler).GetMethod(nameof(End), BindingFlags.NonPublic | BindingFlags.Static));
-            var catalog = new List<string> { "assembly,callback,kind,source,status" };
+            var catalog = new List<string> { "assembly,callback,kind,source,status,method_signature" };
 
             try
             {
@@ -79,6 +88,25 @@ namespace BSProfiler
             catch (Exception ex) { Plugin.Log?.Warn("BSProfiler focus subscriber discovery failed: " + ex.Message); }
 
             _active = this;
+            var assemblyTypes = new Dictionary<Assembly, Type[]>();
+            int discoveryFailures = 0;
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    string source = assembly.IsDynamic ? "" : Path.GetFullPath(assembly.Location);
+                    if (assembly == typeof(CallbackProfiler).Assembly ||
+                        (!source.StartsWith(plugins, StringComparison.OrdinalIgnoreCase) &&
+                         !source.StartsWith(libraries, StringComparison.OrdinalIgnoreCase))) continue;
+                    Type[] discovered;
+                    try { discovered = assembly.GetTypes(); }
+                    catch (ReflectionTypeLoadException ex) { discovered = ex.Types.Where(t => t != null).Cast<Type>().ToArray(); }
+                    assemblyTypes.Add(assembly, discovered);
+                    CallbackDiscovery.Collect(discovered, _delegateTargets, ref discoveryFailures);
+                }
+                catch { discoveryFailures++; }
+            }
+            DiscoveryFailures = discoveryFailures;
             foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
                 string path;
@@ -88,10 +116,8 @@ namespace BSProfiler
                 if (!isPluginAssembly && !path.StartsWith(libraries, StringComparison.OrdinalIgnoreCase)) continue;
                 if (assembly == typeof(CallbackProfiler).Assembly) continue;
 
-                Type[] types;
-                try { types = assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(type => type != null).Cast<Type>().ToArray(); }
-                catch { continue; }
+                if (!assemblyTypes.TryGetValue(assembly, out Type[] types)) continue;
+                int assemblyExtraHooks = 0;
 
                 foreach (Type type in types)
                 {
@@ -119,7 +145,8 @@ namespace BSProfiler
                     {
                         if (!isBehaviour && !isStateMachine && !isTickable && !isHarmonyClass &&
                             method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer" &&
-                            !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method)) continue;
+                            !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method) &&
+                            !_delegateTargets.Contains(method) && !CallbackDiscovery.IsNamedHandler(method)) continue;
                         string? kind = null;
                         try
                         {
@@ -145,10 +172,19 @@ namespace BSProfiler
                                 kind = "Harmony callback";
                         }
                         catch { continue; }
+                        bool extra = kind == null && (_delegateTargets.Contains(method) || CallbackDiscovery.IsNamedHandler(method));
+                        if (extra) kind = _delegateTargets.Contains(method) ? "Mod delegate target" : "Mod event/UI handler";
                         if (kind == null) continue;
 
                         var descriptor = new Descriptor(assembly.GetName().Name ?? "", type.FullName + "." + method.Name,
-                            kind == "Unity focus/pause callback" || kind == "Application.focusChanged subscriber", assembly);
+                            kind == "Unity focus/pause callback" || kind == "Application.focusChanged subscriber", assembly, method.ToString());
+                        if (extra && (assemblyExtraHooks >= 256 || ExtraHooks >= 2048))
+                        {
+                            ExtraHooksOmitted++;
+                            catalog.Add(string.Join(",", CaptureWriter.Csv(descriptor.Assembly), CaptureWriter.Csv(descriptor.Callback),
+                                CaptureWriter.Csv(kind), CaptureWriter.Csv(path), "omitted: extra hook limit", CaptureWriter.Csv(descriptor.Signature)));
+                            continue;
+                        }
                         _samples[method] = new Sample(descriptor);
                         if (!_assemblies.ContainsKey(descriptor.Assembly))
                             _assemblies.Add(descriptor.Assembly, new Sample(new Descriptor(descriptor.Assembly, "")));
@@ -157,6 +193,7 @@ namespace BSProfiler
                         {
                             _harmony.Patch(method, prefix: prefix, finalizer: finalizer);
                             HookCount++;
+                            if (extra) { ExtraHooks++; assemblyExtraHooks++; }
                         }
                         catch (Exception ex)
                         {
@@ -166,7 +203,7 @@ namespace BSProfiler
                         }
                         catalog.Add(string.Join(",", CaptureWriter.Csv(descriptor.Assembly),
                             CaptureWriter.Csv(descriptor.Callback), CaptureWriter.Csv(kind),
-                            CaptureWriter.Csv(path), CaptureWriter.Csv(status)));
+                            CaptureWriter.Csv(path), CaptureWriter.Csv(status), CaptureWriter.Csv(descriptor.Signature)));
                     }
                 }
             }
@@ -183,16 +220,24 @@ namespace BSProfiler
         private static bool HasAttribute(IList<CustomAttributeData> attributes, string name) =>
             attributes.Any(attribute => attribute.AttributeType.FullName == name);
 
-        private static void Begin(out TimingState __state)
+        private static void Begin(MethodBase __originalMethod, out TimingState __state)
         {
+            long entry = Stopwatch.GetTimestamp();
             CallbackProfiler? profiler = _active;
             __state = default;
             if (profiler == null || profiler._installing || Thread.CurrentThread.ManagedThreadId != profiler._mainThreadId) return;
+            if (profiler._depth >= profiler._calls.Length) { profiler.DepthDropped++; return; }
+            if (!profiler._samples.TryGetValue(__originalMethod, out Sample sample)) return;
             __state.AllocatedBytes = MemoryDiagnostics.AllocatedBytes();
             __state.Gc0 = GC.CollectionCount(0);
             __state.Gc1 = GC.CollectionCount(1);
             __state.Gc2 = GC.CollectionCount(2);
             __state.Ticks = Stopwatch.GetTimestamp();
+            __state.EntryTicks = entry;
+            __state.Index = profiler._depth++;
+            __state.CallId = ++profiler._nextCallId;
+            profiler._calls[__state.Index] = new ActiveCall { Sample = sample, CallId = __state.CallId };
+            profiler._hookTicks += __state.Ticks - entry;
         }
 
         private static void End(MethodBase __originalMethod, object? __instance, TimingState __state, Exception? __exception)
@@ -207,6 +252,11 @@ namespace BSProfiler
             long now = Stopwatch.GetTimestamp();
             long ticks = now - __state.Ticks;
             if (ticks < 0) return;
+            ActiveCall call = profiler._calls[__state.Index];
+            ActiveCall parent = __state.Index > 0 ? profiler._calls[__state.Index - 1] : default;
+            profiler._calls[__state.Index] = default;
+            profiler._depth = __state.Index;
+            long selfTicks = Math.Max(0, ticks - call.ChildrenTicks);
             long bytes = __state.AllocatedBytes < 0 ? 0 : Math.Max(0, MemoryDiagnostics.AllocatedBytes() - __state.AllocatedBytes);
             int gc0 = GC.CollectionCount(0) - __state.Gc0;
             int gc1 = GC.CollectionCount(1) - __state.Gc1;
@@ -215,28 +265,46 @@ namespace BSProfiler
             profiler.ObserveReceiver(__instance, sample);
             bool crossing = gc0 > 0 || gc1 > 0 || gc2 > 0;
             if (sample.Calls == 0) profiler._frameSamples.Add(sample);
-            sample.Add(ticks, bytes, crossing);
+            sample.Add(ticks, selfTicks, bytes, crossing);
             Sample assembly = profiler._assemblies[sample.Descriptor.Assembly];
             if (assembly.Calls == 0) profiler._frameAssemblies.Add(assembly);
-            assembly.Add(ticks, bytes, crossing);
-            if (ticks * 1000.0 / Stopwatch.Frequency < 8 && !crossing && __exception == null && !sample.Descriptor.IsFocus) return;
-            if (now - profiler._detailWindowTicks >= Stopwatch.Frequency)
+            assembly.Add(ticks, selfTicks, bytes, crossing);
+            if (__state.Index == 0) { profiler._rootTicks += ticks; if (crossing) profiler._rootGcCrossings++; }
+            try { profiler.WriteCallDetail(sample, __state, parent, ticks, selfTicks, bytes, now, gc0, gc1, gc2, __exception); }
+            finally
             {
-                profiler._detailWindowTicks = now;
-                profiler._detailCount = 0;
+                long finish = Stopwatch.GetTimestamp();
+                profiler._hookTicks += finish - now;
+                if (__state.Index > 0) profiler._calls[__state.Index - 1].ChildrenTicks += finish - __state.EntryTicks;
             }
-            if (profiler._detailCount++ >= 32) { profiler.DetailsDropped++; return; }
+        }
+
+        private void WriteCallDetail(Sample sample, TimingState state, ActiveCall parent, long ticks, long selfTicks,
+            long bytes, long now, int gc0, int gc1, int gc2, Exception? exception)
+        {
+            bool crossing = gc0 > 0 || gc1 > 0 || gc2 > 0;
+            if (ticks * 1000.0 / Stopwatch.Frequency < 8 && !crossing && exception == null && !sample.Descriptor.IsFocus) return;
+            if (now - _detailWindowTicks >= Stopwatch.Frequency)
+            {
+                _detailWindowTicks = now;
+                _detailCount = 0;
+            }
+            if (_detailCount++ >= 32) { DetailsDropped++; return; }
             try
             {
-                string stack = new StackTrace(2, false).ToString();
+                string stack = new StackTrace(3, false).ToString();
                 if (stack.Length > 12000) stack = stack.Substring(0, 12000);
-                profiler._writer.SlowCall(string.Join(",", CaptureWriter.Number((now - profiler._startTicks) * 1000.0 / Stopwatch.Frequency),
+                _writer.SlowCall(string.Join(",", CaptureWriter.Number((now - _startTicks) * 1000.0 / Stopwatch.Frequency),
                     Time.frameCount.ToString(), CaptureWriter.Csv(sample.Descriptor.Assembly), CaptureWriter.Csv(sample.Descriptor.Callback),
-                    CaptureWriter.Number(ticks * 1000.0 / Stopwatch.Frequency), __state.AllocatedBytes < 0 ? "" : bytes.ToString(),
-                    gc0.ToString(), gc1.ToString(), gc2.ToString(), CaptureWriter.Csv(__exception?.GetType().FullName),
-                    CaptureWriter.Csv(stack)));
+                    CaptureWriter.Number(ticks * 1000.0 / Stopwatch.Frequency), state.AllocatedBytes < 0 ? "" : bytes.ToString(),
+                    gc0.ToString(), gc1.ToString(), gc2.ToString(), CaptureWriter.Csv(exception?.GetType().FullName),
+                    CaptureWriter.Csv(stack), state.CallId.ToString(), parent.CallId == 0 ? "" : parent.CallId.ToString(),
+                    CaptureWriter.Csv(parent.Sample?.Descriptor.Callback), state.Index.ToString(),
+                    CaptureWriter.Number(selfTicks * 1000.0 / Stopwatch.Frequency),
+                    crossing ? "gc-overlap: allocation caller unknown" : "no observed GC; unhooked descendants included",
+                    CaptureWriter.Number((state.Ticks - _startTicks) * 1000.0 / Stopwatch.Frequency), CaptureWriter.Csv(sample.Descriptor.Signature)));
             }
-            catch { profiler.DetailsDropped++; }
+            catch { DetailsDropped++; }
         }
 
         private void ObserveReceiver(object? instance, Sample sample)
@@ -245,10 +313,17 @@ namespace BSProfiler
             catch { } // Observation must preserve the original callback and exception.
         }
 
-        public void CaptureFrame(CaptureWriter writer, double elapsedMs, int frame, string scene, double frameMs, double thresholdMs)
+        public void CaptureFrame(CaptureWriter writer, double elapsedMs, int frame, string scene, double frameMs, double thresholdMs,
+            bool observedGc, double gcMarkerMs)
         {
             if (frameMs >= thresholdMs)
             {
+                writer.FrameEvidence(string.Join(",", CaptureWriter.Number(elapsedMs), frame.ToString(), CaptureWriter.Csv(scene),
+                    CaptureWriter.Number(frameMs), CaptureWriter.Number(_rootTicks * 1000.0 / Stopwatch.Frequency),
+                    CaptureWriter.Number(_hookTicks * 1000.0 / Stopwatch.Frequency), _rootGcCrossings.ToString(),
+                    observedGc ? "1" : "0", CaptureWriter.Number(gcMarkerMs), DepthDropped.ToString(),
+                    observedGc || _rootGcCrossings > 0 ? "GC overlap; do not assign whole span to mod" :
+                    "Compare root spans; uncovered native/game/background/wait work possible"));
                 foreach (Sample sample in _frameAssemblies.OrderByDescending(s => s.TotalTicks).Take(8))
                     Write(writer, elapsedMs, frame, scene, frameMs, "assembly", sample);
                 foreach (Sample sample in _frameSamples.OrderByDescending(s => s.TotalTicks).Take(20))
@@ -268,6 +343,8 @@ namespace BSProfiler
             foreach (Sample sample in _frameAssemblies) sample.ResetFrame();
             _frameSamples.Clear();
             _frameAssemblies.Clear();
+            _hookTicks = _rootTicks = 0;
+            _rootGcCrossings = 0;
         }
 
         private void WriteAllocation(CaptureWriter writer, double elapsedMs, int frame, string scene, string scope, Sample sample)
@@ -287,7 +364,10 @@ namespace BSProfiler
                 sample.Calls.ToString(), CaptureWriter.Number(sample.TotalTicks * 1000.0 / Stopwatch.Frequency),
                 CaptureWriter.Number(sample.MaxTicks * 1000.0 / Stopwatch.Frequency),
                 MemoryDiagnostics.AllocationCounterAvailable ? sample.Bytes.ToString() : "",
-                MemoryDiagnostics.AllocationCounterAvailable ? sample.MaxBytes.ToString() : "", sample.Crossings.ToString()));
+                MemoryDiagnostics.AllocationCounterAvailable ? sample.MaxBytes.ToString() : "", sample.Crossings.ToString(),
+                CaptureWriter.Number(sample.SelfTicks * 1000.0 / Stopwatch.Frequency),
+                CaptureWriter.Number(sample.NoGcTicks * 1000.0 / Stopwatch.Frequency),
+                CaptureWriter.Number(sample.GcTicks * 1000.0 / Stopwatch.Frequency), CaptureWriter.Csv(sample.Descriptor.Signature)));
         }
 
         public void Dispose()
@@ -312,8 +392,9 @@ namespace BSProfiler
             public readonly string Callback;
             public readonly bool IsFocus;
             public readonly Assembly? OwnerAssembly;
-            public Descriptor(string assembly, string callback, bool isFocus = false, Assembly? ownerAssembly = null)
-            { Assembly = assembly; Callback = callback; IsFocus = isFocus; OwnerAssembly = ownerAssembly; }
+            public readonly string? Signature;
+            public Descriptor(string assembly, string callback, bool isFocus = false, Assembly? ownerAssembly = null, string? signature = null)
+            { Assembly = assembly; Callback = callback; IsFocus = isFocus; OwnerAssembly = ownerAssembly; Signature = signature; }
         }
 
         private sealed class Sample
@@ -321,27 +402,36 @@ namespace BSProfiler
             public readonly Descriptor Descriptor;
             public int Calls;
             public long TotalTicks;
+            public long SelfTicks, NoGcTicks, GcTicks;
             public long MaxTicks;
             public long Bytes, MaxBytes, WindowBytes, WindowMaxBytes, WindowTicks;
             public int Crossings, WindowCalls, WindowCrossings;
             public Sample(Descriptor descriptor) => Descriptor = descriptor;
-            public void Add(long ticks, long bytes, bool crossing)
+            public void Add(long ticks, long selfTicks, long bytes, bool crossing)
             {
                 Calls++; WindowCalls++;
                 TotalTicks += ticks; WindowTicks += ticks;
+                SelfTicks += selfTicks;
+                if (crossing) GcTicks += ticks; else NoGcTicks += ticks;
                 MaxTicks = Math.Max(MaxTicks, ticks);
                 Bytes += bytes; WindowBytes += bytes;
                 MaxBytes = Math.Max(MaxBytes, bytes); WindowMaxBytes = Math.Max(WindowMaxBytes, bytes);
                 if (crossing) { Crossings++; WindowCrossings++; }
             }
-            public void ResetFrame() { Calls = Crossings = 0; TotalTicks = MaxTicks = Bytes = MaxBytes = 0; }
+            public void ResetFrame() { Calls = Crossings = 0; TotalTicks = MaxTicks = Bytes = MaxBytes = SelfTicks = NoGcTicks = GcTicks = 0; }
             public void ResetWindow() { WindowCalls = WindowCrossings = 0; WindowTicks = WindowBytes = WindowMaxBytes = 0; }
         }
 
         private struct TimingState
         {
-            public long Ticks, AllocatedBytes;
-            public int Gc0, Gc1, Gc2;
+            public long Ticks, AllocatedBytes, EntryTicks, CallId;
+            public int Gc0, Gc1, Gc2, Index;
+        }
+
+        private struct ActiveCall
+        {
+            public Sample? Sample;
+            public long CallId, ChildrenTicks;
         }
     }
 }

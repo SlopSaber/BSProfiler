@@ -151,7 +151,7 @@ namespace BSProfiler
             var session = new StringBuilder();
             session.AppendLine("BSProfiler 0.1.0");
             session.AppendLine("UTC start: " + _startUtc.ToString("O"));
-            session.AppendLine("Capture schema: 3");
+            session.AppendLine("Capture schema: 4");
             session.AppendLine("BSProfiler module MVID: " + typeof(ProfilerBehaviour).Assembly.ManifestModule.ModuleVersionId);
             session.AppendLine("Game version: " + Application.version);
             session.AppendLine("Unity version: " + Application.unityVersion);
@@ -168,6 +168,11 @@ namespace BSProfiler
             session.AppendLine("Tracked markers: " + string.Join(", ", _metrics.Select(metric => metric.Name)));
             session.AppendLine("Callback hooks: " + (_callbackProfiler?.HookCount ?? 0));
             session.AppendLine("Callback hook failures: " + (_callbackProfiler?.FailedCount ?? 0));
+            session.AppendLine("General delegate/UI hooks: " + (_callbackProfiler?.ExtraHooks ?? 0) +
+                "; omitted by limits: " + (_callbackProfiler?.ExtraHooksOmitted ?? 0) +
+                "; discovery failures: " + (_callbackProfiler?.DiscoveryFailures ?? 0));
+            session.AppendLine("Delegate targets discovered from managed IL; named Handle/On/Refresh methods also covered. Max 256 extra hooks per assembly / 2048 overall, depth 128; omissions in catalog. Runtime subscriptions to existing targets covered; late-loaded assemblies not rediscovered.");
+            session.AppendLine("self_ms excludes hooked descendant spans and their measured diagnostics, but includes unhooked descendants/native work and overlapping GC. GC overlap is not allocation-caller attribution. Hook overhead excludes background writer and unsupported nested overflow.");
             session.AppendLine("Per-thread allocation counter: " + MemoryDiagnostics.AllocationCounterAvailable);
             session.AppendLine("Allocation counter capability: " + MemoryDiagnostics.AllocationCounterStatus);
             session.AppendLine("Memory hooks: " + (_memoryDiagnostics?.HookCount ?? 0));
@@ -239,6 +244,7 @@ namespace BSProfiler
                     xrMotionToPhotonMs = latencySeconds * 1000.0;
             }
             int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+            bool observedGc = gc0 != _frameGcCounts[0] || gc1 != _frameGcCounts[1] || gc2 != _frameGcCounts[2];
             if (gc0 != _frameGcCounts[0] || gc1 != _frameGcCounts[1] || gc2 != _frameGcCounts[2])
             {
                 _writer.Event(CaptureWriter.Number(elapsedMs) + ",gc-observed," + CaptureWriter.Csv(
@@ -248,6 +254,7 @@ namespace BSProfiler
             }
             _frameGcCounts[0] = gc0; _frameGcCounts[1] = gc1; _frameGcCounts[2] = gc2;
             double gcBytes = allocationDelta < 0 ? double.NaN : allocationDelta;
+            double gcMarkerMs = double.NaN;
             _frameLine.Clear();
             double budgetMs = 1000.0 / _refreshHz;
             _frameLine.Append(CaptureWriter.Number(elapsedMs)).Append(',').Append(Time.frameCount).Append(',')
@@ -277,12 +284,14 @@ namespace BSProfiler
                 _frameLine.Append(',');
                 if (value >= 0) _frameLine.Append(value);
                 if (metric.Name == "GC Allocated In Frame" && value >= 0) gcBytes = value;
+                if (metric.Name == "GC.Collect" && value >= 0) gcMarkerMs = value / 1000000.0;
             }
             _writer.Frame(_frameLine.ToString());
 
             if (!double.IsNaN(frameMs))
             {
-                _callbackProfiler?.CaptureFrame(_writer, elapsedMs, Time.frameCount, _scene, frameMs, Math.Max(12, budgetMs * 1.5));
+                _callbackProfiler?.CaptureFrame(_writer, elapsedMs, Time.frameCount, _scene, frameMs,
+                    Math.Max(12, budgetMs * 1.5), observedGc, gcMarkerMs);
                 UpdateStatistics(elapsedMs, frameMs, cpuMs, gpuMs, gcBytes, budgetMs);
             }
             if (_writer.Failure != null && _lastWriterError.Length == 0)
