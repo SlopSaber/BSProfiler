@@ -171,7 +171,7 @@ namespace BSProfiler
             session.AppendLine("General delegate/UI hooks: " + (_callbackProfiler?.ExtraHooks ?? 0) +
                 "; omitted by limits: " + (_callbackProfiler?.ExtraHooksOmitted ?? 0) +
                 "; discovery failures: " + (_callbackProfiler?.DiscoveryFailures ?? 0));
-            session.AppendLine("Delegate targets discovered from managed IL; named Handle/On/Refresh methods also covered. Max 256 extra hooks per assembly / 2048 overall, depth 128; omissions in catalog. Runtime subscriptions to existing targets covered; late-loaded assemblies not rediscovered.");
+            session.AppendLine("Plugin delegate targets discovered from managed IL; Harmony/MonoMod/Cecil internals excluded; named Handle/On/Refresh methods also covered. Max 256 extra hooks per assembly / 2048 overall, depth 128; omissions in catalog. Runtime subscriptions to existing targets covered; generic library delegates excluded; late-loaded assemblies not rediscovered.");
             session.AppendLine("self_ms excludes hooked descendant spans and their measured diagnostics, but includes unhooked descendants/native work and overlapping GC. GC overlap is not allocation-caller attribution. Hook overhead excludes background writer and unsupported nested overflow.");
             session.AppendLine("Per-thread allocation counter: " + MemoryDiagnostics.AllocationCounterAvailable);
             session.AppendLine("Allocation counter capability: " + MemoryDiagnostics.AllocationCounterStatus);
@@ -431,10 +431,11 @@ namespace BSProfiler
 
         private double ElapsedMs() => (Stopwatch.GetTimestamp() - _startTicks) * 1000.0 / Stopwatch.Frequency;
 
-        public void StopCapture()
+        public void StopCapture(bool processQuitting = false)
         {
             if (_stopped) return;
             _stopped = true;
+            Plugin.Log?.Info("BSProfiler stopping capture; processQuitting=" + processQuitting);
             SceneManager.activeSceneChanged -= SceneChanged;
             SceneManager.sceneLoaded -= SceneLoaded;
             SceneManager.sceneUnloaded -= SceneUnloaded;
@@ -442,11 +443,11 @@ namespace BSProfiler
             CloseIncident();
             WriteSummary(ElapsedMs());
             _writer?.Event(CaptureWriter.Number(ElapsedMs()) + ",stop," + CaptureWriter.Csv("Capture stopped"));
-            _callbackProfiler?.Dispose();
+            _callbackProfiler?.Stop(processQuitting);
             _callbackProfiler = null;
             _memoryTracker?.Dispose();
             _memoryTracker = null;
-            _memoryDiagnostics?.Dispose();
+            _memoryDiagnostics?.Stop(processQuitting);
             _memoryDiagnostics = null;
             _writer?.Dispose();
             _writer = null;
@@ -456,8 +457,10 @@ namespace BSProfiler
             _metrics.Clear();
             _process?.Dispose();
             _process = null;
+            Plugin.Log?.Info("BSProfiler capture stopped");
         }
 
+        private void OnApplicationQuit() => StopCapture(true);
         private void OnDestroy() => StopCapture();
 
         private sealed class Metric : IDisposable

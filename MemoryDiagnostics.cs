@@ -138,12 +138,14 @@ namespace BSProfiler
             catch { } // Preserve the original operation and any original exception.
         }
 
-        public void Dispose()
+        public void Dispose() => Stop(false);
+
+        public void Stop(bool processQuitting)
         {
             if (_disposed) return;
             _disposed = true;
             _active = null;
-            try { _harmony.UnpatchSelf(); }
+            try { if (!processQuitting) _harmony.UnpatchSelf(); }
             catch (Exception ex) { Plugin.Log?.Error("BSProfiler memory hook cleanup failed: " + ex); }
         }
 

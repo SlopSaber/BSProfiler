@@ -158,7 +158,8 @@ namespace BSProfiler
         {
             if (!_queue.IsAddingCompleted)
                 _queue.CompleteAdding();
-            _thread.Join();
+            if (!_thread.Join(2000))
+                Plugin.Log?.Warn("BSProfiler writer drain exceeded 2 seconds; remaining records may be incomplete at process exit");
         }
 
         public static string Number(double value) => double.IsNaN(value) || double.IsInfinity(value)

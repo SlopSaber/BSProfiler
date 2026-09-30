@@ -95,14 +95,17 @@ namespace BSProfiler
                 try
                 {
                     string source = assembly.IsDynamic ? "" : Path.GetFullPath(assembly.Location);
-                    if (assembly == typeof(CallbackProfiler).Assembly ||
+                    if (assembly == typeof(CallbackProfiler).Assembly || IsInstrumentationFramework(assembly) ||
                         (!source.StartsWith(plugins, StringComparison.OrdinalIgnoreCase) &&
                          !source.StartsWith(libraries, StringComparison.OrdinalIgnoreCase))) continue;
                     Type[] discovered;
                     try { discovered = assembly.GetTypes(); }
                     catch (ReflectionTypeLoadException ex) { discovered = ex.Types.Where(t => t != null).Cast<Type>().ToArray(); }
                     assemblyTypes.Add(assembly, discovered);
-                    CallbackDiscovery.Collect(discovered, _delegateTargets, ref discoveryFailures);
+                    // Extra discovery belongs to mod assemblies; reflection/JIT/serializer libraries
+                    // must not consume hook budgets or intercept the machinery that installs hooks.
+                    if (source.StartsWith(plugins, StringComparison.OrdinalIgnoreCase))
+                        CallbackDiscovery.Collect(discovered, _delegateTargets, ref discoveryFailures);
                 }
                 catch { discoveryFailures++; }
             }
@@ -114,7 +117,7 @@ namespace BSProfiler
                 catch { continue; }
                 bool isPluginAssembly = path.StartsWith(plugins, StringComparison.OrdinalIgnoreCase);
                 if (!isPluginAssembly && !path.StartsWith(libraries, StringComparison.OrdinalIgnoreCase)) continue;
-                if (assembly == typeof(CallbackProfiler).Assembly) continue;
+                if (assembly == typeof(CallbackProfiler).Assembly || IsInstrumentationFramework(assembly)) continue;
 
                 if (!assemblyTypes.TryGetValue(assembly, out Type[] types)) continue;
                 int assemblyExtraHooks = 0;
@@ -146,7 +149,7 @@ namespace BSProfiler
                         if (!isBehaviour && !isStateMachine && !isTickable && !isHarmonyClass &&
                             method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer" &&
                             !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method) &&
-                            !_delegateTargets.Contains(method) && !CallbackDiscovery.IsNamedHandler(method)) continue;
+                            !(isPluginAssembly && (_delegateTargets.Contains(method) || CallbackDiscovery.IsNamedHandler(method)))) continue;
                         string? kind = null;
                         try
                         {
@@ -172,7 +175,8 @@ namespace BSProfiler
                                 kind = "Harmony callback";
                         }
                         catch { continue; }
-                        bool extra = kind == null && (_delegateTargets.Contains(method) || CallbackDiscovery.IsNamedHandler(method));
+                        bool extra = kind == null && isPluginAssembly &&
+                            (_delegateTargets.Contains(method) || CallbackDiscovery.IsNamedHandler(method));
                         if (extra) kind = _delegateTargets.Contains(method) ? "Mod delegate target" : "Mod event/UI handler";
                         if (kind == null) continue;
 
@@ -370,16 +374,28 @@ namespace BSProfiler
                 CaptureWriter.Number(sample.GcTicks * 1000.0 / Stopwatch.Frequency), CaptureWriter.Csv(sample.Descriptor.Signature)));
         }
 
-        public void Dispose()
+        private static bool IsInstrumentationFramework(Assembly assembly)
+        {
+            string name = assembly.GetName().Name ?? "";
+            return name == "0Harmony" || name == "Harmony" ||
+                name.StartsWith("MonoMod", StringComparison.Ordinal) || name.StartsWith("Mono.Cecil", StringComparison.Ordinal);
+        }
+
+        public void Dispose() => Stop(false);
+
+        public void Stop(bool processQuitting)
         {
             if (_disposed) return;
             _disposed = true;
             _active = null;
-            try { _harmony.UnpatchSelf(); }
+            // Disabled callbacks become no-ops. Process teardown does not need thousands of
+            // synchronous method rewrites; normal live capture disposal still removes hooks.
+            try { if (!processQuitting) _harmony.UnpatchSelf(); }
             catch (Exception ex) { Plugin.Log?.Error("BSProfiler callback unpatch failed: " + ex); }
             finally
             {
-                _samples.Clear();
+                // Background finalizers may already hold this instance. Keep their immutable
+                // method lookup intact; it is released with the disposed profiler instance.
                 _assemblies.Clear();
                 _frameSamples.Clear();
                 _frameAssemblies.Clear();

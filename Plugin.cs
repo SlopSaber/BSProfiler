@@ -25,7 +25,7 @@ namespace BSProfiler
         {
             if (_owner != null)
             {
-                _owner.GetComponent<ProfilerBehaviour>()?.StopCapture();
+                _owner.GetComponent<ProfilerBehaviour>()?.StopCapture(true);
                 Object.Destroy(_owner);
                 _owner = null;
             }
