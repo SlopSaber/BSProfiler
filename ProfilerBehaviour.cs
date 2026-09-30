@@ -79,6 +79,7 @@ namespace BSProfiler
         private string _incidentScene = "";
         private bool _stopped;
         private string? _captureDirectory;
+        private bool _fullCallbacks;
         private readonly List<string> _startupEvents = new List<string>();
 
         private void Awake()
@@ -94,6 +95,7 @@ namespace BSProfiler
                 string directory = Path.Combine(root, "UserData", "BSProfiler", _startUtc.ToString("yyyyMMdd-HHmmss") + "-" + _process.Id);
                 Directory.CreateDirectory(directory);
                 _captureDirectory = directory;
+                _fullCallbacks = File.Exists(Path.Combine(root, "UserData", "BSProfiler", "full-callbacks.enabled"));
                 Plugin.Log?.Info("BSProfiler bootstrap started");
                 StartupPhase("recorder-discovery", () => DiscoverMetrics(directory));
                 StartupPhase("frame-recorders", () =>
@@ -108,7 +110,9 @@ namespace BSProfiler
                 foreach (string row in _startupEvents) _writer!.Event(row);
                 _startupEvents.Clear();
                 WriteSession(directory);
-                Plugin.Log?.Info("BSProfiler callback installation scheduled; startup callback coverage is partial until completion");
+                Plugin.Log?.Info(_fullCallbacks
+                    ? "BSProfiler full callback tracing explicitly enabled; incremental hook installation adds CPU and GC overhead"
+                    : "BSProfiler passive capture; mass callback discovery/installation disabled");
                 Plugin.Log?.Info("BSProfiler memory hooks: " + _memoryDiagnostics!.HookCount + " installed, " + _memoryDiagnostics.FailedCount + " failed");
                 if (!MemoryDiagnostics.AllocationCounterAvailable)
                     Plugin.Log?.Warn("BSProfiler allocation readings unavailable: " + MemoryDiagnostics.AllocationCounterStatus);
@@ -122,7 +126,7 @@ namespace BSProfiler
                 SceneManager.sceneUnloaded += SceneUnloaded;
                 Application.logMessageReceivedThreaded += LogReceived;
                 Plugin.Log?.Info("BSProfiler capture: " + directory);
-                StartCoroutine(_callbackProfiler!.InstallRoutine(() =>
+                if (_fullCallbacks) StartCoroutine(_callbackProfiler!.InstallRoutine(() =>
                 {
                     if (_stopped) return;
                     WriteSession(directory);
@@ -184,7 +188,8 @@ namespace BSProfiler
             var session = new StringBuilder();
             session.AppendLine("BSProfiler 0.1.0");
             session.AppendLine("UTC start: " + _startUtc.ToString("O"));
-            session.AppendLine("Capture schema: 6");
+            session.AppendLine("Capture schema: 7");
+            session.AppendLine("Full callback tracing enabled: " + _fullCallbacks);
             if (_process != null)
             {
                 try
@@ -196,7 +201,10 @@ namespace BSProfiler
                 catch (Exception ex) { session.AppendLine("Process start unavailable: " + ex.GetType().Name); }
             }
             session.AppendLine("Callback installation complete: " + (_callbackProfiler?.InstallationComplete ?? false));
-            session.AppendLine("Callback setup is incremental on the main thread, soft 2 ms work slices; individual discovery/patch operations can exceed the slice. Callback startup coverage is partial until callback-install-finished. Early process/IPA loading before capture requires game logs or an external trace. events.csv records startup phases, per-assembly discovery/patch timing and completion.");
+            session.AppendLine(_fullCallbacks
+                ? "Full callback setup is incremental on the main thread, soft 2 ms work slices; individual discovery/patch operations can exceed the slice. Callback startup coverage is partial until callback-install-finished. Installation and active hooks can create CPU/GC stalls; do not treat their cost as normal game behavior."
+                : "Passive capture: no mass callback discovery/rewriting. Callback/assembly attribution, callback allocation and callback receiver retention are unavailable. Frame/native markers, GC, process memory, startup phases, scene/log events and memory/parser spans remain active.");
+            session.AppendLine("Full callback tracing requires UserData/BSProfiler/full-callbacks.enabled before launch. Early process/IPA loading before capture requires game logs or an external trace. events.csv records startup phases and optional full-callback installation progress.");
             session.AppendLine("Main thread ID: " + System.Threading.Thread.CurrentThread.ManagedThreadId);
             session.AppendLine("Memory operations include CustomJSONData v2/v3 top-level parser spans on their actual thread, with start/end elapsed bounds and most recently observed frame/scene. Nested parser/memory hooks on the same thread are suppressed. GC overlap remains unattributed.");
             session.AppendLine("BSProfiler module MVID: " + typeof(ProfilerBehaviour).Assembly.ManifestModule.ModuleVersionId);
