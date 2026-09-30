@@ -119,10 +119,11 @@ namespace BSProfiler
                     {
                         if (!isBehaviour && !isStateMachine && !isTickable && !isHarmonyClass &&
                             method.Name != "Prefix" && method.Name != "Postfix" && method.Name != "Finalizer" &&
-                            !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method)) continue;
+                            !_focusHandlers.Contains(method) && !IsEnvironmentSetup(method) && !IsReplayEventDetail(method)) continue;
                         string? kind = null;
                         try
                         {
+                            if (IsReplayEventDetail(method)) kind = "Replay event detail";
                             if (method.IsAbstract || method.ContainsGenericParameters || method.GetMethodBody() == null) continue;
                             if (isBehaviour && UnityCallbacks.Contains(method.Name) && IsVoidWithoutParameters(method))
                                 kind = "Unity callback";
@@ -179,6 +180,21 @@ namespace BSProfiler
         private static bool IsEnvironmentSetup(MethodInfo method) =>
             (method.DeclaringType?.FullName == "Chroma.EnvironmentEnhancement.EnvironmentEnhancementManager" && method.Name == "GetAllGameObjects") ||
             (method.DeclaringType?.FullName == "Chroma.EnvironmentEnhancement.LookupID" && method.Name == "Get");
+
+        // Tick includes these synchronous subscribers. Record their nested time to distinguish
+        // event dispatch from note lookup, score emulation, and visual work without changing replay logic.
+        private static bool IsReplayEventDetail(MethodInfo method)
+        {
+            string? type = method.DeclaringType?.FullName;
+            if (type == "BeatLeader.Replayer.Emulation.ReplayerNotesCutter")
+                return method.Name == "ProcessNote" || method.Name == "TryFindSpawnedNote";
+            if (type == "BeatLeader.Replayer.Emulation.ReplayerScoreProcessor")
+                return method.Name == "SetupEmulator" || method.Name == "SimulateNoteWasCut" ||
+                    method.Name == "SimulateNoteWasMissed" || method.Name == "HandleNoteBeatmapEventDequeued" ||
+                    method.Name == "HandleWallBeatmapEventDequeued";
+            if (type == "BeatLeader.Replayer.ReplayBeatmapData") return method.Name == "FindNoteDataForEvent";
+            return type == "BeatLeader.Replayer.BeatmapVisualsController" && method.Name == "HandleNoteBeatmapEventDequeued";
+        }
 
         private static bool HasAttribute(IList<CustomAttributeData> attributes, string name) =>
             attributes.Any(attribute => attribute.AttributeType.FullName == name);
