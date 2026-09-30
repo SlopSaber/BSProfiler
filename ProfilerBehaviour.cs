@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 using IPA.Loader;
 using Unity.Profiling;
 using Unity.Profiling.LowLevel.Unsafe;
@@ -39,7 +38,7 @@ namespace BSProfiler
         private CaptureWriter? _writer;
         private CallbackProfiler? _callbackProfiler;
         private MemoryDiagnostics? _memoryDiagnostics;
-        private Task<long>? _workingSetTask;
+        private MemoryTracker? _memoryTracker;
         private Process? _process;
         private XRDisplaySubsystem? _display;
         private long _startTicks;
@@ -56,7 +55,7 @@ namespace BSProfiler
         private string _lastWriterError = "";
         private long _monoUsedBytes;
         private long _totalAllocatedBytes;
-        private long _workingSetBytes;
+        private long _workingSetBytes = -1;
         private float _refreshHz = 90f;
         private int _windowUsed;
         private int _windowFrames;
@@ -96,7 +95,8 @@ namespace BSProfiler
                 _cpuRecorder = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "CPU Main Thread Frame Time");
                 _gpuRecorder = new ProfilerRecorder("GPU Frame Time", options: ProfilerRecorderOptions.Default | ProfilerRecorderOptions.StartImmediately);
                 _writer = new CaptureWriter(directory, FrameHeader());
-                _callbackProfiler = new CallbackProfiler(directory, root, _writer, _startTicks);
+                _memoryTracker = new MemoryTracker(_writer, _startTicks, _startUtc);
+                _callbackProfiler = new CallbackProfiler(directory, root, _writer, _startTicks, _memoryTracker.Retention);
                 _memoryDiagnostics = new MemoryDiagnostics(_writer, _startTicks);
                 WriteSession(directory);
                 Plugin.Log?.Info("BSProfiler callback hooks: " + _callbackProfiler.HookCount + " installed, " + _callbackProfiler.FailedCount + " failed");
@@ -151,7 +151,7 @@ namespace BSProfiler
             var session = new StringBuilder();
             session.AppendLine("BSProfiler 0.1.0");
             session.AppendLine("UTC start: " + _startUtc.ToString("O"));
-            session.AppendLine("Capture schema: 2");
+            session.AppendLine("Capture schema: 3");
             session.AppendLine("BSProfiler module MVID: " + typeof(ProfilerBehaviour).Assembly.ManifestModule.ModuleVersionId);
             session.AppendLine("Game version: " + Application.version);
             session.AppendLine("Unity version: " + Application.unityVersion);
@@ -172,6 +172,11 @@ namespace BSProfiler
             session.AppendLine("Allocation counter capability: " + MemoryDiagnostics.AllocationCounterStatus);
             session.AppendLine("Memory hooks: " + (_memoryDiagnostics?.HookCount ?? 0));
             session.AppendLine("Memory hook failures: " + (_memoryDiagnostics?.FailedCount ?? 0));
+            session.AppendLine("Memory trends: every second and on observed GC; Windows GetProcessMemoryInfo reports resident/private committed memory, blanks on failure.");
+            session.AppendLine("Mod retention: weak callback receiver observations, including background receivers; direct instance fields every 30 seconds, 8192 instance / 32 reference-field limits.");
+            session.AppendLine("Retention scan: max four instances / soft 0.5 ms per frame; field counts are not retained heap sizes or proof of a leak; shared native references can repeat.");
+            session.AppendLine("Static roots and arbitrary object graphs require heap snapshots; no forced GC or global collection-policy changes.");
+            session.AppendLine("Snapshot request: write a label to UserData/BSProfiler/memory-snapshot.request; consumed after MainMenu is active for 10 seconds. Full snapshots can pause and produce large files; unsupported captures report failure.");
             session.AppendLine("Slow-call detail: >=8 ms, GC crossing, exception, or focus callback; max 32 rows per second.");
             session.AppendLine("Recorder values can lag Update wall-clock samples; inspect neighboring frames.");
             session.AppendLine("Callback time and allocation totals are inclusive; nested rows must not be summed.");
@@ -204,19 +209,14 @@ namespace BSProfiler
                 ? (nowTicks - _lastLateTicks) * 1000.0 / Stopwatch.Frequency : double.NaN;
             _lastFrameTicks = nowTicks;
             _memoryDiagnostics?.SetFrame(Time.frameCount, _scene);
-            if (_workingSetTask != null && _workingSetTask.IsCompleted)
-            {
-                try { _workingSetBytes = _workingSetTask.GetAwaiter().GetResult(); }
-                catch { _workingSetBytes = 0; }
-                _workingSetTask = null;
-            }
+            _memoryTracker?.Tick(elapsedMs, Time.frameCount, _scene);
+            _monoUsedBytes = _memoryTracker?.MonoUsed ?? 0;
+            _totalAllocatedBytes = _memoryTracker?.UnityAllocated ?? 0;
+            _workingSetBytes = _memoryTracker?.WorkingSet ?? -1;
 
             if (elapsedMs >= _nextSystemSampleMs)
             {
                 _nextSystemSampleMs = elapsedMs + 1000;
-                _monoUsedBytes = Profiler.GetMonoUsedSizeLong();
-                _totalAllocatedBytes = Profiler.GetTotalAllocatedMemoryLong();
-                if (_workingSetTask == null) _workingSetTask = Task.Run(ReadWorkingSet);
                 RefreshDisplay();
             }
 
@@ -263,7 +263,8 @@ namespace BSProfiler
                 .Append(xrDroppedFrames < 0 ? "" : xrDroppedFrames.ToString()).Append(',')
                 .Append(xrPresentCount < 0 ? "" : xrPresentCount.ToString()).Append(',')
                 .Append(CaptureWriter.Number(xrMotionToPhotonMs)).Append(',')
-                .Append(_monoUsedBytes).Append(',').Append(_totalAllocatedBytes).Append(',').Append(_workingSetBytes).Append(',')
+                .Append(_monoUsedBytes).Append(',').Append(_totalAllocatedBytes).Append(',')
+                .Append(_workingSetBytes < 0 ? "" : _workingSetBytes.ToString()).Append(',')
                 .Append(gc0).Append(',').Append(gc1).Append(',').Append(gc2).Append(',')
                 .Append(allocationDelta < 0 ? "" : allocationDelta.ToString()).Append(',')
                 .Append(CaptureWriter.Number(_previousProfilerMs)).Append(',')
@@ -294,12 +295,6 @@ namespace BSProfiler
         }
 
         private void LateUpdate() => _lastLateTicks = Stopwatch.GetTimestamp();
-
-        private static long ReadWorkingSet()
-        {
-            try { using (Process process = Process.GetCurrentProcess()) return process.WorkingSet64; }
-            catch { return 0; }
-        }
 
         private void RefreshDisplay()
         {
@@ -440,6 +435,8 @@ namespace BSProfiler
             _writer?.Event(CaptureWriter.Number(ElapsedMs()) + ",stop," + CaptureWriter.Csv("Capture stopped"));
             _callbackProfiler?.Dispose();
             _callbackProfiler = null;
+            _memoryTracker?.Dispose();
+            _memoryTracker = null;
             _memoryDiagnostics?.Dispose();
             _memoryDiagnostics = null;
             _writer?.Dispose();

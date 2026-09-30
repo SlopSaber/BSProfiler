@@ -19,7 +19,8 @@ namespace BSProfiler
         private const string HarmonyId = "BSProfiler.callback-timing";
         private static readonly HashSet<string> UnityCallbacks = new HashSet<string>(StringComparer.Ordinal)
         {
-            "Update", "LateUpdate", "FixedUpdate", "OnGUI", "OnUpdate", "OnLateUpdate", "OnFixedUpdate"
+            "Update", "LateUpdate", "FixedUpdate", "OnGUI", "OnUpdate", "OnLateUpdate", "OnFixedUpdate",
+            "Awake", "OnEnable", "OnDisable", "OnDestroy"
         };
         private static readonly HashSet<string> TickCallbacks = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -36,6 +37,8 @@ namespace BSProfiler
         private readonly int _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         private readonly CaptureWriter _writer;
         private readonly long _startTicks;
+        private readonly ModRetentionTracker _retention;
+        private volatile bool _installing = true;
         private double _allocationWindowStartMs;
         private int _detailCount;
         private long _detailWindowTicks;
@@ -45,16 +48,18 @@ namespace BSProfiler
         public int HookCount { get; private set; }
         public int FailedCount { get; private set; }
 
-        public CallbackProfiler(string directory, string gameRoot, CaptureWriter writer, long startTicks)
+        public CallbackProfiler(string directory, string gameRoot, CaptureWriter writer, long startTicks, ModRetentionTracker retention)
         {
             _writer = writer;
             _startTicks = startTicks;
+            _retention = retention;
             try { Install(directory, gameRoot); }
             catch
             {
                 Dispose();
                 throw;
             }
+            _installing = false;
         }
 
         private void Install(string directory, string gameRoot)
@@ -182,7 +187,7 @@ namespace BSProfiler
         {
             CallbackProfiler? profiler = _active;
             __state = default;
-            if (profiler == null || Thread.CurrentThread.ManagedThreadId != profiler._mainThreadId) return;
+            if (profiler == null || profiler._installing || Thread.CurrentThread.ManagedThreadId != profiler._mainThreadId) return;
             __state.AllocatedBytes = MemoryDiagnostics.AllocatedBytes();
             __state.Gc0 = GC.CollectionCount(0);
             __state.Gc1 = GC.CollectionCount(1);
@@ -190,10 +195,15 @@ namespace BSProfiler
             __state.Ticks = Stopwatch.GetTimestamp();
         }
 
-        private static void End(MethodBase __originalMethod, TimingState __state, Exception? __exception)
+        private static void End(MethodBase __originalMethod, object? __instance, TimingState __state, Exception? __exception)
         {
             CallbackProfiler? profiler = _active;
-            if (profiler == null || __state.Ticks == 0 || !profiler._samples.TryGetValue(__originalMethod, out Sample sample)) return;
+            if (profiler == null || profiler._installing || !profiler._samples.TryGetValue(__originalMethod, out Sample sample)) return;
+            if (__state.Ticks == 0)
+            {
+                profiler.ObserveReceiver(__instance, sample);
+                return;
+            }
             long now = Stopwatch.GetTimestamp();
             long ticks = now - __state.Ticks;
             if (ticks < 0) return;
@@ -201,6 +211,8 @@ namespace BSProfiler
             int gc0 = GC.CollectionCount(0) - __state.Gc0;
             int gc1 = GC.CollectionCount(1) - __state.Gc1;
             int gc2 = GC.CollectionCount(2) - __state.Gc2;
+            // Take timing/allocation endpoints before observer registration allocates metadata.
+            profiler.ObserveReceiver(__instance, sample);
             bool crossing = gc0 > 0 || gc1 > 0 || gc2 > 0;
             if (sample.Calls == 0) profiler._frameSamples.Add(sample);
             sample.Add(ticks, bytes, crossing);
@@ -225,6 +237,12 @@ namespace BSProfiler
                     CaptureWriter.Csv(stack)));
             }
             catch { profiler.DetailsDropped++; }
+        }
+
+        private void ObserveReceiver(object? instance, Sample sample)
+        {
+            try { _retention.Observe(instance, sample.Descriptor.Assembly); }
+            catch { } // Observation must preserve the original callback and exception.
         }
 
         public void CaptureFrame(CaptureWriter writer, double elapsedMs, int frame, string scene, double frameMs, double thresholdMs)

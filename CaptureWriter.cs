@@ -19,6 +19,10 @@ namespace BSProfiler
         private readonly StreamWriter _allocations;
         private readonly StreamWriter _memory;
         private readonly StreamWriter _slowCalls;
+        private readonly StreamWriter _memoryTrend;
+        private readonly StreamWriter _modMemory;
+        private readonly StreamWriter _modFields;
+        private readonly StreamWriter _snapshots;
         private int _dropped;
 
         public string DirectoryPath { get; }
@@ -37,6 +41,10 @@ namespace BSProfiler
             _allocations = Open("callback-allocations.csv", "end_ms,interval_ms,frame,scene,scope,assembly,callback,calls,total_alloc_bytes,max_call_alloc_bytes,total_ms,gc_crossing_calls");
             _memory = Open("memory-operations.csv", "elapsed_ms,frame,scene,thread_id,operation,duration_ms,gc_gen0_delta,gc_gen1_delta,gc_gen2_delta,exception,caller_stack");
             _slowCalls = Open("slow-calls.csv", "elapsed_ms,frame,assembly,callback,duration_ms,alloc_bytes,gc_gen0_delta,gc_gen1_delta,gc_gen2_delta,exception,caller_stack");
+            _memoryTrend = Open("memory-trend.csv", "elapsed_ms,utc,frame,scene,scene_visit,reason,mono_used_bytes,mono_reserved_bytes,unity_allocated_bytes,unity_reserved_bytes,working_set_bytes,private_committed_bytes,peak_working_set_bytes,process_sample_age_ms,process_counter_status,mono_delta_bytes,mono_growth_from_start_bytes,private_delta_bytes,private_growth_from_start_bytes,mono_change_since_previous_menu_bytes,private_change_since_previous_menu_bytes,gc_gen0,gc_gen1,gc_gen2,gc_gen0_delta,gc_gen1_delta,gc_gen2_delta");
+            _modMemory = Open("mod-memory.csv", "sample_id,start_ms,end_ms,frame,scene,assembly,type,alive_observed_instances,alive_after_observed_gc,destroyed_unity_shells,alive_delta,reference_fields_inspected,reference_fields_omitted,field_read_failures,observation_attempts_dropped");
+            _modFields = Open("mod-fields.csv", "sample_id,elapsed_ms,frame,scene,assembly,owner_type,observed_instance_id,first_observed_ms,alive_after_observed_gc,field,value_type,kind,count,count_delta,payload_bytes,native_object_bytes");
+            _snapshots = Open("memory-snapshots.csv", "elapsed_ms,request_frame,request_scene,path,status,duration_ms,file_bytes,detail");
             _thread = new Thread(WriteLoop) { IsBackground = true, Name = "BSProfiler writer" };
             _thread.Start();
         }
@@ -56,6 +64,10 @@ namespace BSProfiler
         public void Allocation(string line) => Enqueue(5, line);
         public void Memory(string line) => Enqueue(6, line);
         public void SlowCall(string line) => Enqueue(7, line);
+        public void MemoryTrend(string line) => Enqueue(8, line);
+        public void ModMemory(string line) => Enqueue(9, line);
+        public void ModField(string line) => Enqueue(10, line);
+        public void Snapshot(string line) => Enqueue(11, line);
 
         private void Enqueue(byte kind, string line)
         {
@@ -84,6 +96,10 @@ namespace BSProfiler
                         case 5: _allocations.WriteLine(entry.Line); break;
                         case 6: _memory.WriteLine(entry.Line); break;
                         case 7: _slowCalls.WriteLine(entry.Line); break;
+                        case 8: _memoryTrend.WriteLine(entry.Line); break;
+                        case 9: _modMemory.WriteLine(entry.Line); break;
+                        case 10: _modFields.WriteLine(entry.Line); break;
+                        case 11: _snapshots.WriteLine(entry.Line); break;
                     }
 
                     long now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -109,6 +125,10 @@ namespace BSProfiler
                 _allocations.Dispose();
                 _memory.Dispose();
                 _slowCalls.Dispose();
+                _memoryTrend.Dispose();
+                _modMemory.Dispose();
+                _modFields.Dispose();
+                _snapshots.Dispose();
             }
         }
 
@@ -122,6 +142,10 @@ namespace BSProfiler
             _allocations.Flush();
             _memory.Flush();
             _slowCalls.Flush();
+            _memoryTrend.Flush();
+            _modMemory.Flush();
+            _modFields.Flush();
+            _snapshots.Flush();
         }
 
         public void Dispose()
